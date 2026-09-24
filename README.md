@@ -303,21 +303,8 @@ Root scripts: `install:all`, `test`, `test:e2e`, `lint`, `typecheck`, `build`, `
   waiting package (logged), so a station admin can help a customer who cannot read their email.
 - Charges are decimals with two places; integer minor units would be the production choice.
 
-## Code review
-
-The project was reviewed twice independently, once over the API and once over the frontend and Docker
-setup, and every finding was verified against the code before anything changed. The reviews found a
-credential in the application logs, a broken concurrency demo, four panels that stopped refreshing after
-thirty events, a station balance that only summed the page it had fetched, and a locker board that
-showed customers each other's names. All of those are fixed, with tests that fail against the old code.
-
-[docs/REVIEW.md](docs/REVIEW.md) records each finding, the failure it caused, and the five decisions
-deliberately left open, including single-currency balances, non-idempotent payments, and sessions that
-survive a user being deactivated.
-
 ## Where to read next
 
 - [apps/api/README.md](apps/api/README.md): endpoints, error codes, configuration reference, curl walkthrough.
 - [docs/DESIGN.md](docs/DESIGN.md): why `FOR UPDATE SKIP LOCKED` over the alternatives, schema and
   constraints, pickup-code security model, pricing rule, failure handling, risks and rollback.
-- [docs/REVIEW.md](docs/REVIEW.md): the review record, the fixes, and the open decisions.
