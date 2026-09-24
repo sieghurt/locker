@@ -1,0 +1,170 @@
+name: smart-package-locker
+
+x-db-env: &db-env
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_USER: locker
+  DB_PASSWORD: locker
+  DB_SSL: "false"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: locker
+      POSTGRES_PASSWORD: locker
+      POSTGRES_DB: locker
+    ports:
+      # Local tooling and the e2e suite only; not exposed to the network.
+      - "127.0.0.1:${DB_PORT_HOST:-5433}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./docker/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U locker -d locker"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # NestJS backend. The browser reaches it through `web` at /api/*; the published port is bound to
+  # localhost for curl and Swagger. It must not be reachable from the LAN: TRUST_PROXY makes the API
+  # believe X-Forwarded-For, which anyone talking to it directly could use to dodge the rate limits.
+  api:
+    build:
+      context: ./apps/api
+      target: runtime
+    depends_on:
+      db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    environment:
+      <<: *db-env
+      DB_NAME: locker
+      DB_MIGRATIONS_RUN: "true"
+      PORT: "3000"
+      # This compose file is the local development stack. The image defaults to production; demo mode
+      # (below) is refused under NODE_ENV=production, so say what this is.
+      NODE_ENV: ${NODE_ENV:-development}
+      TRUST_PROXY: "true"
+      PICKUP_CODE_SECRET: ${PICKUP_CODE_SECRET:-local-dev-secret-change-me-before-production}
+      PICKUP_CODE_LENGTH: "6"
+      PICKUP_CODE_ENCRYPTION_KEY: ${PICKUP_CODE_ENCRYPTION_KEY:-local-dev-encryption-key-change-me-before-prod}
+      STORAGE_RATE_PER_DAY: ${STORAGE_RATE_PER_DAY:-10}
+      STORAGE_TIER_1_DAYS: "5"
+      STORAGE_TIER_2_DAYS: "5"
+      STORAGE_FREE_DAYS: ${STORAGE_FREE_DAYS:-0}
+      STORAGE_CURRENCY: ${STORAGE_CURRENCY:-UNITS}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-300}
+      PICKUP_RATE_LIMIT_PER_MINUTE: ${PICKUP_RATE_LIMIT_PER_MINUTE:-10}
+      PICKUP_MAX_FAILED_ATTEMPTS: ${PICKUP_MAX_FAILED_ATTEMPTS:-5}
+      PICKUP_LOCKOUT_MINUTES: ${PICKUP_LOCKOUT_MINUTES:-15}
+      SEED_LOCKERS: ${SEED_LOCKERS:-SMALL:3,MEDIUM:2,LARGE:1}
+      # --- accounts & login ---
+      # DEMO_MODE returns login codes in the API response and lists accounts at GET /api/auth/demo, so the
+      # login page offers one-click sign-in. Local convenience only: set DEMO_MODE=false before sharing a URL.
+      DEMO_MODE: ${DEMO_MODE:-true}
+      AUTH_SECRET: ${AUTH_SECRET:-local-dev-auth-secret-change-me-before-production}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@locker.local}
+      SEED_USERS: ${SEED_USERS:-agent@locker.local:AGENT,alice@locker.local:CUSTOMER,bob@locker.local:CUSTOMER}
+      # --- email: Mailpit captures everything locally (inbox at http://localhost:8025) ---
+      MAIL_HOST: ${MAIL_HOST:-mailpit}
+      MAIL_PORT: ${MAIL_PORT:-1025}
+      MAIL_SECURE: ${MAIL_SECURE:-false}
+      MAIL_USER: ${MAIL_USER:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-Smart Package Locker <no-reply@locker.local>}
+    ports:
+      - "127.0.0.1:${API_PORT_HOST:-3000}:3000"
+
+  # Local mailbox: every email the API sends (login codes, pickup codes) lands here instead of the internet.
+  # Point MAIL_HOST/MAIL_PORT/MAIL_USER/MAIL_PASSWORD at a real SMTP provider to send for real.
+  mailpit:
+    image: axllent/mailpit:latest
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+    ports:
+      - "127.0.0.1:${MAILPIT_PORT_HOST:-8025}:8025"
+
+  # One-shot: waits for the tunnel, prints the public URL, exits. Its output is what you see in
+  # `docker compose --profile share up`; for a detached stack run `npm run share:url` instead.
+  share-url:
+    profiles: ["share"]
+    image: alpine:3
+    depends_on:
+      ngrok:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        i=0;
+        while [ $$i -lt 60 ]; do
+          url=$$(wget -qO- http://ngrok:4040/api/tunnels 2>/dev/null | grep -o '"public_url":"https://[^"]*"' | head -1 | cut -d'"' -f4);
+          if [ -n "$$url" ]; then
+            printf '\n================= PUBLIC URL =================\n  Kiosk UI   %s\n  Swagger    %s/api/docs\n  Inspector  http://localhost:4040\n==============================================\n\n' "$$url" "$$url";
+            exit 0;
+          fi;
+          i=$$((i + 1));
+          sleep 1;
+        done;
+        echo 'The ngrok tunnel did not come up. Check: docker compose logs ngrok' >&2;
+        exit 1
+
+  # React kiosk UI served by nginx, which also proxies /api/* to the backend (same origin, no CORS).
+  web:
+    build:
+      context: ./apps/web
+    depends_on:
+      - api
+    ports:
+      - "${WEB_PORT_HOST:-8080}:80"
+
+  # One-shot backend e2e runner: `docker compose --profile test run --rm e2e`
+  e2e:
+    profiles: ["test"]
+    build:
+      context: ./apps/api
+      target: test
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *db-env
+      DB_NAME: locker_test
+      PICKUP_CODE_SECRET: e2e-only-secret-not-for-production-use-0000
+      PICKUP_CODE_ENCRYPTION_KEY: e2e-only-encryption-key-not-for-production-00
+      AUTH_SECRET: e2e-only-auth-secret-not-for-production-0000
+
+  # Optional test helper: exposes the kiosk (UI + /api) on a public URL through ngrok so the app can be
+  # tried from a phone or shared with a reviewer. Never started by default:
+  #   NGROK_AUTHTOKEN=... docker compose --profile share up --build
+  # The public URL is printed in this container's logs and at http://localhost:4040.
+  ngrok:
+    profiles: ["share"]
+    image: ngrok/ngrok:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        if [ -z "$$NGROK_AUTHTOKEN" ]; then
+          echo "NGROK_AUTHTOKEN is not set. Get a free token at https://dashboard.ngrok.com and put it in .env" >&2;
+          exit 1;
+        fi;
+        printf 'version: 3\nagent:\n  web_addr: 0.0.0.0:4040\n' > /tmp/ngrok.yml;
+        exec ngrok http web:80 --config /tmp/ngrok.yml --log stdout --log-format logfmt
+        $${NGROK_URL:+--url=$$NGROK_URL}
+    environment:
+      # Compose interpolates every service, profile or not, so the token cannot be marked required here;
+      # the command above fails fast with a clear message instead.
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+      # Optional fixed domain from your ngrok dashboard, e.g. my-lockers.ngrok-free.app
+      NGROK_URL: ${NGROK_URL:-}
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "${NGROK_INSPECTOR_PORT_HOST:-4040}:4040"
+
+volumes:
+  db-data:
